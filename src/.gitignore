@@ -1,12 +1,22 @@
+# MapReduce temporary and output files
 *.*/
 main/mr-tmp/
+main/mr-out-*
+main/mr-*-*
 mrtmp.*
 824-mrinput-*.txt
 /main/diff.out
+
+# Other temporary files
 /mapreduce/x.txt
 /pbservice/x.txt
 /kvpaxos/x.txt
+
+# Compiled binaries and libraries
 *.so
 /main/mrcoordinator
 /main/mrsequential
 /main/mrworker
+
+# Unix socket files
+/var/tmp/5840-mr-*

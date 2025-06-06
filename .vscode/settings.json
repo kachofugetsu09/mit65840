@@ -1,0 +1,30 @@
+{
+    "go.lintTool": "golint",
+    "go.buildOnSave": "off",
+    "go.lintOnSave": "off",
+    "go.vetOnSave": "off",
+    "go.formatOnSave": false,
+    "files.exclude": {
+        "**/mrapps/*.go": false
+    },
+    "go.toolsEnvVars": {
+        "GO111MODULE": "on",
+        "GOFLAGS": ""
+    },
+    "go.useLanguageServer": true,
+    "gopls": {
+        "directoryFilters": ["-**/mrapps", "-**/main"],
+        "buildFlags": [],
+        "env": {
+            "GO111MODULE": "on"
+        },
+        "experimentalWorkspaceModule": true,
+        "allowModfileModifications": true,
+        "allowImplicitNetworkAccess": true
+    },
+    "go.alternateTools": {
+        "go": "/usr/bin/go"
+    },
+    "go.goroot": "/usr/lib/go-1.22",
+    "go.gopath": "/home/wangy/go"
+}
