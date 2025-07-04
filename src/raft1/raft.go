@@ -166,6 +166,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // 接收者当前任期
 	Success bool // 是否成功接收日志条目
+
+	// 快速回退优化字段
+	XTerm  int // 这个是Follower中与Leader冲突的Log对应的任期号。如果Follower在对应位置没有Log，那么这里会返回 -1。
+	XIndex int // 这个是Follower中，对应任期号为XTerm的第一条Log条目的槽位号。
+	XLen   int // 这个是Follower中Log的长度。如果Follower没有任何Log，那么这里会返回 0。
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -199,15 +204,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 统一检查所有 PrevLogIndex，包括 0
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
-		DPrintf("[%d] AppendEntries失败: prevLogIndex %d 越界，当前日志长度 %d, Leader=%d",
-			rf.me, args.PrevLogIndex, len(rf.log), args.LeaderId)
+		// 快速回退：日志太短的情况
+		reply.XLen = len(rf.log)
+		reply.XIndex = -1
+		reply.XTerm = -1
+		DPrintf("[%d] AppendEntries失败: prevLogIndex %d 越界，当前日志长度 %d, Leader=%d, 设置XLen=%d",
+			rf.me, args.PrevLogIndex, len(rf.log), args.LeaderId, reply.XLen)
 		return
 	}
 
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
 		reply.Success = false
-		DPrintf("[%d] AppendEntries失败: prevLogTerm %d 不匹配, 当前日志[%d]任期 %d, Leader=%d",
-			rf.me, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.LeaderId)
+		// 快速回退：任期不匹配的情况
+		conflictTerm := rf.log[args.PrevLogIndex].Term
+		reply.XTerm = conflictTerm
+
+		// 找到XTerm任期的第一个条目索引
+		reply.XIndex = args.PrevLogIndex
+		for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == conflictTerm {
+			reply.XIndex--
+		}
+		reply.XLen = len(rf.log)
+
+		DPrintf("[%d] AppendEntries失败: prevLogTerm %d 不匹配, 当前日志[%d]任期 %d, Leader=%d, 设置XTerm=%d, XIndex=%d, XLen=%d",
+			rf.me, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.LeaderId,
+			reply.XTerm, reply.XIndex, reply.XLen)
 		return
 	}
 
@@ -216,38 +237,68 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) > 0 {
 		insertIndex := args.PrevLogIndex + 1 // 新条目开始插入的位置
 
-		DPrintf("[%d] 收到来自Leader[%d]的%d个日志条目，插入位置=%d",
-			rf.me, args.LeaderId, len(args.Entries), insertIndex)
+		DPrintf("[%d] 收到来自Leader[%d]的%d个日志条目，插入位置=%d，当前日志长度=%d",
+			rf.me, args.LeaderId, len(args.Entries), insertIndex, len(rf.log))
 
-		// 正确处理日志冲突和追加
+		// 找到第一个冲突的位置
+		conflictIndex := -1
 		for i, newEntry := range args.Entries {
 			currentIndex := insertIndex + i
-
 			if currentIndex < len(rf.log) {
-				// 如果该位置已有日志条目，检查是否冲突
 				if rf.log[currentIndex].Term != newEntry.Term {
-					// 发现冲突，截断从这个位置开始的所有日志
-					DPrintf("[%d] 发现冲突在索引 %d: 我的任期=%d, Leader的任期=%d，截断日志从%d到%d",
-						rf.me, currentIndex, rf.log[currentIndex].Term, newEntry.Term, currentIndex, len(rf.log)-1)
-					rf.log = rf.log[:currentIndex]
-					// 截断后，将剩余的所有新条目都追加
-					for j := i; j < len(args.Entries); j++ {
-						rf.log = append(rf.log, args.Entries[j])
-						DPrintf("[%d] 追加新日志条目: index=%d, term=%d, command=%v",
-							rf.me, args.Entries[j].LogIndex, args.Entries[j].Term, args.Entries[j].Command)
-					}
-					break // 处理完成
+					conflictIndex = currentIndex
+					DPrintf("[%d] 发现冲突在索引 %d: 我的任期=%d, Leader的任期=%d",
+						rf.me, currentIndex, rf.log[currentIndex].Term, newEntry.Term)
+					break
 				}
-				// 如果没有冲突，继续检查下一个
 			} else {
-				// 如果超出当前日志长度，追加这个条目和之后的所有条目
-				for j := i; j < len(args.Entries); j++ {
-					rf.log = append(rf.log, args.Entries[j])
-					DPrintf("[%d] 追加新日志条目: index=%d, term=%d, command=%v",
-						rf.me, args.Entries[j].LogIndex, args.Entries[j].Term, args.Entries[j].Command)
-				}
-				break // 处理完成
+				// 超出当前日志长度，从这里开始追加
+				conflictIndex = currentIndex
+				break
 			}
+		}
+
+		// 如果发现冲突或需要扩展日志
+		if conflictIndex != -1 {
+			// 截断从冲突位置开始的所有日志
+			if conflictIndex < len(rf.log) {
+				DPrintf("[%d] 截断日志从索引 %d 到 %d", rf.me, conflictIndex, len(rf.log)-1)
+				rf.log = rf.log[:conflictIndex]
+
+				// 如果截断的位置影响了已应用的日志，需要调整lastApplied和commitIndex
+				if rf.lastApplied >= conflictIndex {
+					oldLastApplied := rf.lastApplied
+					rf.lastApplied = conflictIndex - 1
+					DPrintf("[%d] 由于日志截断，调整lastApplied: %d->%d", rf.me, oldLastApplied, rf.lastApplied)
+				}
+				if rf.commitIndex >= conflictIndex {
+					oldCommitIndex := rf.commitIndex
+					rf.commitIndex = conflictIndex - 1
+					DPrintf("[%d] 由于日志截断，调整commitIndex: %d->%d", rf.me, oldCommitIndex, rf.commitIndex)
+				}
+			}
+
+			// 追加从冲突位置开始的所有新条目
+			startAppendIdx := conflictIndex - insertIndex
+			for i := startAppendIdx; i < len(args.Entries); i++ {
+				rf.log = append(rf.log, args.Entries[i])
+				DPrintf("[%d] 追加新日志条目: index=%d, term=%d, command=%v",
+					rf.me, args.Entries[i].LogIndex, args.Entries[i].Term, args.Entries[i].Command)
+			}
+		} else {
+			// 没有冲突，但仍需检查是否有多余的日志需要截断
+			lastNewEntryIndex := insertIndex + len(args.Entries) - 1
+			if len(rf.log) > lastNewEntryIndex+1 {
+				DPrintf("[%d] 截断多余日志从索引 %d 到 %d", rf.me, lastNewEntryIndex+1, len(rf.log)-1)
+				rf.log = rf.log[:lastNewEntryIndex+1]
+			}
+		}
+	} else {
+		// 即使没有新条目，也要检查是否需要截断多余的日志
+		// 这是心跳消息的情况，确保日志不会超过PrevLogIndex
+		if len(rf.log) > args.PrevLogIndex+1 {
+			DPrintf("[%d] 心跳消息截断多余日志从索引 %d 到 %d", rf.me, args.PrevLogIndex+1, len(rf.log)-1)
+			rf.log = rf.log[:args.PrevLogIndex+1]
 		}
 	}
 
@@ -260,6 +311,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
+	// 成功时也初始化快速回退字段
+	reply.XTerm = -1
+	reply.XIndex = -1
+	reply.XLen = len(rf.log)
 
 }
 
@@ -486,7 +541,6 @@ func (rf *Raft) sendAppendEntriesToPeer(server int) {
 
 		if rf.nextIndex[server] <= rf.getLastLogIndex() {
 			// 有需要复制的日志条目
-			// 注意：需要将逻辑索引转换为数组索引
 			startArrayIndex := rf.nextIndex[server] // nextIndex本身就是要发送的第一个条目的逻辑索引，也等于数组索引
 			if startArrayIndex < len(rf.log) {
 				entries = make([]logEntry, len(rf.log)-startArrayIndex)
@@ -544,11 +598,11 @@ func (rf *Raft) sendAppendEntriesToPeer(server int) {
 					rf.mu.Unlock()
 					return
 				} else {
-					// 日志不一致，减少 nextIndex 重试
-					if rf.nextIndex[server] > 1 {
-						rf.nextIndex[server]--
-						DPrintf("[%d] 日志不一致，减少 nextIndex[%d] 到 %d", rf.me, server, rf.nextIndex[server])
-					}
+					// 日志不一致，使用快速回退算法
+					oldNextIndex := rf.nextIndex[server]
+					rf.nextIndex[server] = rf.optimizeNextIndex(server, reply)
+					DPrintf("[%d] 快速回退 nextIndex[%d]: %d->%d (XTerm=%d, XIndex=%d, XLen=%d)",
+						rf.me, server, oldNextIndex, rf.nextIndex[server], reply.XTerm, reply.XIndex, reply.XLen)
 				}
 			}
 			rf.mu.Unlock()
@@ -569,7 +623,6 @@ func (rf *Raft) updateCommitIndex() {
 	// 从最后一个日志条目开始向前检查
 	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
 		// 检查索引 N 处的日志条目是否可以提交
-		// N 是逻辑索引，也是数组索引（因为我们的数组索引=逻辑索引）
 		if N < len(rf.log) && rf.log[N].Term == rf.currentTerm { // 只能提交当前任期的日志条目
 			count := 1 // Leader 自己算一票
 
@@ -823,7 +876,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // 生成随机选举超时时间
 func (rf *Raft) getRandomElectionTimeout() time.Duration {
-	// 选举超时时间：150-300ms，符合论文建议
 	return time.Duration(150+rand.Int63n(150)) * time.Millisecond
 }
 
@@ -851,5 +903,38 @@ func (rf *Raft) applier() {
 		}
 		rf.mu.Unlock()
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// optimizeNextIndex 根据快速回退字段优化 nextIndex
+func (rf *Raft) optimizeNextIndex(server int, reply *AppendEntriesReply) int {
+	if reply.XTerm == -1 {
+		// 情况 1: Follower日志太短 (PrevLogIndex 越界)
+		// 直接设置为Follower的日志长度
+		return reply.XLen
+	}
+
+	// 情况 2: Follower日志与Leader日志在PrevLogIndex处任期不匹配
+	conflictTerm := reply.XTerm
+	lastIndexOfXTerm := -1
+
+	// Leader 从自己的日志中倒序查找是否有和 Follower 冲突的 XTerm 任期的日志条目
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == conflictTerm {
+			lastIndexOfXTerm = i
+			break
+		}
+	}
+
+	if lastIndexOfXTerm != -1 {
+		// Leader 有与 Follower 冲突的 XTerm 任期，
+		// 则 Leader 的 nextIndex[server] 应该设置为 Leader 中该 XTerm 的最后一个条目的下一个位置。
+		// 这样可以确保跳过 Follower 的冲突任期，并从 Leader 自己的该任期之后开始同步。
+		return lastIndexOfXTerm + 1
+	} else {
+		// Leader 没有 Follower 报告的 XTerm 任期（这意味着 Leader 的日志比 Follower 的更旧或者完全不同）
+		// Leader 的 nextIndex[server] 应该设置为 Follower 报告的 XIndex。
+		// 这样可以跳过 Follower 的整个冲突任期。
+		return reply.XIndex
 	}
 }
