@@ -7,6 +7,8 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -97,6 +99,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	//保存Log currentTerm votedFor
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.log)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -117,6 +129,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var log []logEntry
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&log) != nil || d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil {
+		DPrintf("节点[%d] 恢复持久化状态失败", rf.me)
+	} else {
+		rf.log = log
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		DPrintf("节点[%d] 恢复持久化状态成功: term=%d, votedFor=%d, log长度=%d",
+			rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -190,6 +218,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
+		rf.persist() // 持久化状态变化
 	}
 
 	rf.lastHeartbeat = time.Now()
@@ -285,12 +314,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				DPrintf("[%d] 追加新日志条目: index=%d, term=%d, command=%v",
 					rf.me, args.Entries[i].LogIndex, args.Entries[i].Term, args.Entries[i].Command)
 			}
+			rf.persist() // 持久化日志变化
 		} else {
 			// 没有冲突，但仍需检查是否有多余的日志需要截断
 			lastNewEntryIndex := insertIndex + len(args.Entries) - 1
 			if len(rf.log) > lastNewEntryIndex+1 {
 				DPrintf("[%d] 截断多余日志从索引 %d 到 %d", rf.me, lastNewEntryIndex+1, len(rf.log)-1)
 				rf.log = rf.log[:lastNewEntryIndex+1]
+				rf.persist() // 持久化日志截断
 			}
 		}
 	} else {
@@ -299,15 +330,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(rf.log) > args.PrevLogIndex+1 {
 			DPrintf("[%d] 心跳消息截断多余日志从索引 %d 到 %d", rf.me, args.PrevLogIndex+1, len(rf.log)-1)
 			rf.log = rf.log[:args.PrevLogIndex+1]
+			rf.persist() // 持久化日志截断
 		}
 	}
 
 	//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommitIndex > rf.commitIndex {
 		oldCommitIndex := rf.commitIndex
-		rf.commitIndex = min(args.LeaderCommitIndex, rf.getLastLogIndex())
-		DPrintf("[%d] Follower 更新 commitIndex: %d->%d (LeaderCommit=%d)",
-			rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommitIndex)
+		// 计算这次AppendEntries后的最后一个日志条目索引
+		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+		rf.commitIndex = min(args.LeaderCommitIndex, lastNewEntryIndex)
+		DPrintf("[%d] Follower 更新 commitIndex: %d->%d (LeaderCommit=%d, lastNewEntryIndex=%d)",
+			rf.me, oldCommitIndex, rf.commitIndex, args.LeaderCommitIndex, lastNewEntryIndex)
 	}
 
 	reply.Success = true
@@ -335,6 +369,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
+		rf.persist() // 持久化状态变化
 	}
 
 	reply.Term = rf.currentTerm
@@ -352,6 +387,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		// 重置选举定时器，因为我们投了票
 		rf.electionTimer.Reset(rf.getRandomElectionTimeout())
+		rf.persist() // 持久化投票状态
 		DPrintf("[%d] 投票给[%d]", rf.me, args.CandidateId)
 	} else {
 		reply.VoteGranted = false
@@ -378,12 +414,30 @@ func (rf *Raft) sendHeartbeats() {
 				return
 			}
 
+			// 检查是否有新的日志条目需要发送
+			prevLogIndex := rf.nextIndex[server] - 1
+			var entries []logEntry
+
+			if rf.nextIndex[server] <= rf.getLastLogIndex() {
+				// 有需要复制的日志条目，发送包含日志条目的 AppendEntries
+				startArrayIndex := rf.nextIndex[server]
+				if startArrayIndex < len(rf.log) {
+					entries = make([]logEntry, len(rf.log)-startArrayIndex)
+					copy(entries, rf.log[startArrayIndex:])
+				} else {
+					entries = make([]logEntry, 0)
+				}
+			} else {
+				// 没有新的日志条目，发送空的心跳
+				entries = make([]logEntry, 0)
+			}
+
 			args := &AppendEntriesArgs{
 				Term:              rf.currentTerm,
 				LeaderId:          rf.me,
-				PrevLogIndex:      rf.nextIndex[server] - 1,
-				PrevLogTerm:       rf.getLogTerm(rf.nextIndex[server] - 1),
-				Entries:           make([]logEntry, 0),
+				PrevLogIndex:      prevLogIndex,
+				PrevLogTerm:       rf.getLogTerm(prevLogIndex),
+				Entries:           entries,
 				LeaderCommitIndex: rf.commitIndex,
 			}
 			rf.mu.Unlock()
@@ -404,15 +458,24 @@ func (rf *Raft) sendHeartbeats() {
 					rf.state = Follower
 					rf.votedFor = -1
 					rf.electionTimer.Reset(rf.getRandomElectionTimeout())
+					rf.persist() // 持久化状态变化
 				} else if reply.Success {
-					// 心跳成功，更新 matchIndex（心跳时entries为空，所以matchIndex = prevLogIndex）
-					rf.matchIndex[server] = args.PrevLogIndex
-					// 心跳成功说明日志是一致的，不需要减少nextIndex
+					// 成功，更新 nextIndex 和 matchIndex
+					rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+					rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+					if len(args.Entries) > 0 {
+						DPrintf("[%d] 心跳中成功复制到节点[%d]: nextIndex=%d, matchIndex=%d",
+							rf.me, server, rf.nextIndex[server], rf.matchIndex[server])
+						// 检查是否可以提交新的日志条目
+						rf.updateCommitIndex()
+					}
 				} else {
-					// 心跳失败，说明日志不一致，需要减少 nextIndex
-					if rf.nextIndex[server] > 1 {
-						rf.nextIndex[server]--
-						DPrintf("[%d] 心跳失败，减少 nextIndex[%d] 到 %d", rf.me, server, rf.nextIndex[server])
+					// 失败，使用快速回退算法
+					if reply.Term <= rf.currentTerm {
+						oldNextIndex := rf.nextIndex[server]
+						rf.nextIndex[server] = rf.optimizeNextIndex(server, reply)
+						DPrintf("[%d] 心跳失败，快速回退 nextIndex[%d]: %d->%d (XTerm=%d, XIndex=%d, XLen=%d)",
+							rf.me, server, oldNextIndex, rf.nextIndex[server], reply.XTerm, reply.XIndex, reply.XLen)
 					}
 				}
 				rf.mu.Unlock()
@@ -480,7 +543,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	currentTerm := rf.currentTerm
 
 	//获得新的要添加的日志的索引位置
-	newLogIndex := rf.getLastLogIndex() + 1
+	newLogIndex := len(rf.log) // 使用数组长度作为新的日志索引
 	//创建一个新的Entry
 	newEntry := logEntry{
 		LogIndex: newLogIndex,
@@ -490,11 +553,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	//把新日志添加到自己的日志数组当中
 	rf.log = append(rf.log, newEntry)
+	rf.persist() // 持久化新日志
 
 	// 再次检查Leader身份和任期，如果发生变化则回滚
 	if rf.state != Leader || rf.currentTerm != currentTerm {
 		// 回滚刚才添加的日志条目
 		rf.log = rf.log[:len(rf.log)-1]
+		rf.persist() // 持久化回滚
 		DPrintf("[%d] Start函数执行期间失去Leader身份，回滚日志条目", rf.me)
 		return -1, rf.currentTerm, false
 	}
@@ -702,6 +767,7 @@ func (rf *Raft) startNewElection() {
 	rf.state = Candidate
 	rf.votedFor = rf.me
 	rf.lastHeartbeat = time.Now()
+	rf.persist() // 持久化选举状态
 
 	DPrintf("[%d] 开始选举: %d->%d", rf.me, oldTerm, rf.currentTerm)
 	go rf.startElection()
@@ -792,6 +858,7 @@ func (rf *Raft) handleRequestVoteReply(server int, requestTerm int, reply *Reque
 	if reply.Term > rf.currentTerm {
 		DPrintf("[%d] 发现更高的任期 %d > %d, 转为Follower", rf.me, reply.Term, rf.currentTerm)
 		rf.becomeFollower(reply.Term)
+		rf.persist() // 持久化状态变化
 		return false
 	}
 
@@ -808,10 +875,11 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.votedFor = -1
 	rf.lastHeartbeat = time.Now()
 	rf.electionTimer.Reset(rf.getRandomElectionTimeout())
+	rf.persist() // 持久化状态变化
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	return rf.log[len(rf.log)-1].LogIndex
+	return len(rf.log) - 1
 }
 
 // 获取指定索引日志条目的任期
@@ -868,6 +936,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(rf.getRandomElectionTimeout())
 	rf.heartbeatTimer = time.NewTimer(100 * time.Millisecond)
 
+	// 初始化时恢复持久化状态
+	rf.readPersist(persister.ReadRaftState())
+
 	go rf.ticker()
 	go rf.applier() // 启动应用日志的 goroutine
 
@@ -883,25 +954,49 @@ func (rf *Raft) getRandomElectionTimeout() time.Duration {
 func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
+
+		// 检查是否有新的日志条目需要应用
+		if rf.lastApplied >= rf.commitIndex {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		// 一次性收集所有需要应用的条目，避免在发送过程中释放锁
+		var toApply []raftapi.ApplyMsg
+
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			applyIndex := rf.lastApplied
 
-			if applyIndex < len(rf.log) && rf.log[applyIndex].Command != nil {
+			// 检查日志索引是否有效
+			if applyIndex >= len(rf.log) {
+				DPrintf("[%d] 错误: 尝试应用索引 %d 但日志长度只有 %d", rf.me, applyIndex, len(rf.log))
+				rf.lastApplied-- // 回滚
+				break
+			}
+
+			if rf.log[applyIndex].Command != nil {
+				// 使用日志条目中的逻辑索引，而不是数组索引
+				logicalIndex := rf.log[applyIndex].LogIndex
 				applyMsg := raftapi.ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log[applyIndex].Command,
-					CommandIndex: applyIndex,
+					CommandIndex: logicalIndex,
 				}
-
-				DPrintf("[%d] 应用日志条目: index=%d, command=%v", rf.me, applyIndex, rf.log[applyIndex].Command)
-
-				rf.mu.Unlock()
-				rf.applyCh <- applyMsg
-				rf.mu.Lock()
+				toApply = append(toApply, applyMsg)
+				DPrintf("[%d] 准备应用日志条目: arrayIndex=%d, logicalIndex=%d, command=%v",
+					rf.me, applyIndex, logicalIndex, rf.log[applyIndex].Command)
 			}
 		}
 		rf.mu.Unlock()
+
+		// 按顺序发送所有待应用的消息
+		for _, msg := range toApply {
+			DPrintf("[%d] 应用日志条目: index=%d, command=%v", rf.me, msg.CommandIndex, msg.Command)
+			rf.applyCh <- msg
+		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -910,7 +1005,7 @@ func (rf *Raft) applier() {
 func (rf *Raft) optimizeNextIndex(server int, reply *AppendEntriesReply) int {
 	if reply.XTerm == -1 {
 		// 情况 1: Follower日志太短 (PrevLogIndex 越界)
-		// 直接设置为Follower的日志长度
+		// 直接设置为Follower的日志长度，这样下次 prevLogIndex = XLen - 1
 		return reply.XLen
 	}
 
