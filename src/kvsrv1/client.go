@@ -43,12 +43,8 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 			} else if reply.Err == rpc.ErrNoKey {
 				// 键不存在：这是确定的结果，直接返回
 				return "", 0, rpc.ErrNoKey
-			} else if reply.Err == rpc.ErrVersion {
-				// 理论上Get不应该返回版本错误，但为了安全起见返回ErrMaybe
-				return "", 0, rpc.ErrMaybe
-			}
-			// 其他服务器错误，直接返回
-			return "", 0, reply.Err
+			} 
+
 		}
 		// 网络调用失败（超时或网络错误），继续重试
 		// 因为Get操作不修改服务器状态，重试是安全的

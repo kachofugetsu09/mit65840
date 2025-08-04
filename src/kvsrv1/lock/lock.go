@@ -16,12 +16,6 @@ type Lock struct {
 	key string // 锁键名：在KV存储中用于存储锁状态的键
 }
 
-const (
-	Unlocked = iota
-	Locking
-	Locked
-	Unlocking
-)
 
 // The tester calls MakeLock() and passes in a k/v clerk; your code can
 // perform a Put or Get by calling lk.ck.Put() or lk.ck.Get().
@@ -44,7 +38,6 @@ func MakeLock(ck kvtest.IKVClerk, l string) *Lock {
 // 2. 如果锁可用（不存在或值为空），尝试获取
 // 3. 如果已经持有锁，直接返回
 // 4. 如果被其他客户端持有，继续等待
-// 5. 处理网络异常和不确定状态
 func (lk *Lock) Acquire() {
 	for {
 		// 获取锁的当前状态
@@ -92,7 +85,6 @@ func (lk *Lock) Acquire() {
 // 1. 检查当前是否持有锁
 // 2. 如果持有锁，尝试释放（设置值为空字符串）
 // 3. 如果不持有锁，直接返回
-// 4. 处理网络异常和不确定状态
 func (lk *Lock) Release() {
 	for {
 		// 获取锁的当前状态
