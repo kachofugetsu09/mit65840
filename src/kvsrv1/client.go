@@ -2,10 +2,9 @@ package kvsrv
 
 import (
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
 )
-
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -30,6 +29,20 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
+
+	args := &rpc.GetArgs{Key: key}
+	reply := &rpc.GetReply{}
+	ok := ck.clnt.Call(ck.server, "KVServer.Get", args, reply)
+	if ok {
+		if reply.Err == rpc.OK {
+			return reply.Value, reply.Version, rpc.OK
+		} else if reply.Err == rpc.ErrNoKey {
+			return "", 0, rpc.ErrNoKey
+		} else if reply.Err == rpc.ErrVersion {
+			return "", 0, rpc.ErrMaybe
+		}
+		return "", 0, reply.Err
+	}
 	return "", 0, rpc.ErrNoKey
 }
 
@@ -52,5 +65,43 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return rpc.ErrNoKey
+
+	args := &rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := &rpc.PutReply{}
+
+	// First attempt
+	ok := ck.clnt.Call(ck.server, "KVServer.Put", args, reply)
+
+	if ok {
+		if reply.Err == rpc.OK {
+			return rpc.OK
+		} else if reply.Err == rpc.ErrVersion {
+			// First call with ErrVersion should return ErrVersion
+			return rpc.ErrVersion
+		}
+		if reply.Err == rpc.ErrNoKey {
+			return rpc.ErrNoKey
+		}
+		return reply.Err
+	}
+
+	// If first call failed, keep retrying
+	for {
+		reply = &rpc.PutReply{}
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", args, reply)
+
+		if ok {
+			if reply.Err == rpc.OK {
+				return rpc.OK
+			} else if reply.Err == rpc.ErrVersion {
+				// Retry with ErrVersion should return ErrMaybe
+				return rpc.ErrMaybe
+			}
+			if reply.Err == rpc.ErrNoKey {
+				return rpc.ErrNoKey
+			}
+			return reply.Err
+		}
+		// Continue retrying if call failed
+	}
 }
