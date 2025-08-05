@@ -58,6 +58,9 @@ type Raft struct {
 	lastHeartbeat  time.Time   // 上次收到心跳的时间
 
 	applyCh chan raftapi.ApplyMsg // 用于发送已提交的日志条目
+
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 type logEntry struct {
@@ -92,23 +95,19 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	rf.persister.Save(rf.encodeState(), nil)
+}
 
-	//保存Log currentTerm votedFor
+// encode Raft state for persistence
+func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.log)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-
-	raftState := w.Bytes()
-	rf.persister.Save(raftState, nil)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -116,19 +115,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -136,14 +122,23 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []logEntry
 	var currentTerm int
 	var votedFor int
-	if d.Decode(&log) != nil || d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+
+	if d.Decode(&log) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("节点[%d] 恢复持久化状态失败", rf.me)
 	} else {
 		rf.log = log
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		DPrintf("节点[%d] 恢复持久化状态成功: term=%d, votedFor=%d, log长度=%d",
-			rf.me, rf.currentTerm, rf.votedFor, len(rf.log))
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		DPrintf("节点[%d] 恢复持久化状态成功: term=%d, votedFor=%d, log长度=%d, lastIncludedIndex=%d",
+			rf.me, rf.currentTerm, rf.votedFor, rf.getMemoryLogLength(), rf.lastIncludedIndex)
 	}
 }
 
@@ -161,6 +156,38 @@ func (rf *Raft) PersistBytes() int {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 
+	if rf.killed() {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	//如果自己的最后应用索引已经大于这个要快照的索引，说明快照已经过期
+	if rf.lastIncludedIndex >= index || index > rf.commitIndex {
+		return
+	}
+
+	// Convert logical index to array index
+	arrayIndex := index - rf.lastIncludedIndex - 1
+	if arrayIndex < 0 || arrayIndex >= rf.getMemoryLogLength() {
+		return
+	}
+
+	// Get the term of the entry at the snapshot index
+	rf.lastIncludedTerm = rf.log[arrayIndex].Term
+
+	// Keep logs after the snapshot index
+	ssLogs := make([]logEntry, 0)
+	if arrayIndex+1 < rf.getMemoryLogLength() {
+		ssLogs = append(ssLogs, rf.log[arrayIndex+1:]...)
+	}
+
+	rf.lastIncludedIndex = index
+	rf.log = ssLogs // 更新日志条目
+
+	// Persist the snapshot
+	rf.persister.Save(rf.encodeState(), snapshot)
 }
 
 // example RequestVote RPC arguments structure.
@@ -230,33 +257,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	//2.reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-	// 统一检查所有 PrevLogIndex，包括 0
-	if args.PrevLogIndex >= len(rf.log) {
+	// Check if prevLogIndex is in snapshot range
+	if args.PrevLogIndex < rf.lastIncludedIndex {
 		reply.Success = false
-		// 快速回退：日志太短的情况
-		reply.XLen = len(rf.log)
+		reply.XLen = rf.getTotalLogLength()
 		reply.XIndex = -1
 		reply.XTerm = -1
-		DPrintf("[%d] AppendEntries失败: prevLogIndex %d 越界，当前日志长度 %d, Leader=%d, 设置XLen=%d",
-			rf.me, args.PrevLogIndex, len(rf.log), args.LeaderId, reply.XLen)
+		DPrintf("[%d] AppendEntries失败: prevLogIndex %d 在快照中，lastIncludedIndex=%d",
+			rf.me, args.PrevLogIndex, rf.lastIncludedIndex)
 		return
 	}
 
-	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+	// Check if prevLogIndex is beyond current log
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.Success = false
+		reply.XLen = rf.getTotalLogLength()
+		reply.XIndex = -1
+		reply.XTerm = -1
+		DPrintf("[%d] AppendEntries失败: prevLogIndex %d 越界，当前最后索引 %d, Leader=%d",
+			rf.me, args.PrevLogIndex, rf.getLastLogIndex(), args.LeaderId)
+		return
+	}
+
+	// Get the term at prevLogIndex (snapshot-aware)
+	prevLogTerm := rf.getLogTerm(args.PrevLogIndex)
+	if args.PrevLogTerm != prevLogTerm {
 		reply.Success = false
 		// 快速回退：任期不匹配的情况
-		conflictTerm := rf.log[args.PrevLogIndex].Term
-		reply.XTerm = conflictTerm
+		reply.XTerm = prevLogTerm
+		reply.XLen = rf.getTotalLogLength()
 
 		// 找到XTerm任期的第一个条目索引
 		reply.XIndex = args.PrevLogIndex
-		for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == conflictTerm {
+		for reply.XIndex > rf.lastIncludedIndex && rf.getLogTerm(reply.XIndex-1) == prevLogTerm {
 			reply.XIndex--
 		}
-		reply.XLen = len(rf.log)
 
 		DPrintf("[%d] AppendEntries失败: prevLogTerm %d 不匹配, 当前日志[%d]任期 %d, Leader=%d, 设置XTerm=%d, XIndex=%d, XLen=%d",
-			rf.me, args.PrevLogTerm, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.LeaderId,
+			rf.me, args.PrevLogTerm, args.PrevLogIndex, prevLogTerm, args.LeaderId,
 			reply.XTerm, reply.XIndex, reply.XLen)
 		return
 	}
@@ -267,20 +305,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		insertIndex := args.PrevLogIndex + 1 // 新条目开始插入的位置
 
 		DPrintf("[%d] 收到来自Leader[%d]的%d个日志条目，插入位置=%d，当前日志长度=%d",
-			rf.me, args.LeaderId, len(args.Entries), insertIndex, len(rf.log))
+			rf.me, args.LeaderId, len(args.Entries), insertIndex, rf.getMemoryLogLength())
 
 		// 找到第一个冲突的位置
 		conflictIndex := -1
 		for i, newEntry := range args.Entries {
 			currentIndex := insertIndex + i
-			if currentIndex < len(rf.log) {
-				if rf.log[currentIndex].Term != newEntry.Term {
+			// Convert logical index to array index for comparison
+			currentArrayIndex := currentIndex - rf.lastIncludedIndex - 1
+
+			if currentArrayIndex < rf.getMemoryLogLength() && currentArrayIndex >= 0 {
+				if rf.log[currentArrayIndex].Term != newEntry.Term {
 					conflictIndex = currentIndex
 					DPrintf("[%d] 发现冲突在索引 %d: 我的任期=%d, Leader的任期=%d",
-						rf.me, currentIndex, rf.log[currentIndex].Term, newEntry.Term)
+						rf.me, currentIndex, rf.log[currentArrayIndex].Term, newEntry.Term)
 					break
 				}
-			} else {
+			} else if currentArrayIndex >= rf.getMemoryLogLength() {
 				// 超出当前日志长度，从这里开始追加
 				conflictIndex = currentIndex
 				break
@@ -290,9 +331,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 如果发现冲突或需要扩展日志
 		if conflictIndex != -1 {
 			// 截断从冲突位置开始的所有日志
-			if conflictIndex < len(rf.log) {
-				DPrintf("[%d] 截断日志从索引 %d 到 %d", rf.me, conflictIndex, len(rf.log)-1)
-				rf.log = rf.log[:conflictIndex]
+			conflictArrayIndex := rf.logicalToArrayIndex(conflictIndex)
+			if conflictArrayIndex < rf.getMemoryLogLength() && conflictArrayIndex >= 0 {
+				DPrintf("[%d] 截断日志从索引 %d 到 %d", rf.me, conflictIndex, rf.getLastLogIndex())
+				rf.log = rf.log[:conflictArrayIndex]
 
 				// 如果截断的位置影响了已应用的日志，需要调整lastApplied和commitIndex
 				if rf.lastApplied >= conflictIndex {
@@ -318,18 +360,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			// 没有冲突，但仍需检查是否有多余的日志需要截断
 			lastNewEntryIndex := insertIndex + len(args.Entries) - 1
-			if len(rf.log) > lastNewEntryIndex+1 {
-				DPrintf("[%d] 截断多余日志从索引 %d 到 %d", rf.me, lastNewEntryIndex+1, len(rf.log)-1)
-				rf.log = rf.log[:lastNewEntryIndex+1]
+			lastNewArrayIndex := lastNewEntryIndex - rf.lastIncludedIndex - 1
+			if rf.getMemoryLogLength() > lastNewArrayIndex+1 {
+				DPrintf("[%d] 截断多余日志从索引 %d 到 %d", rf.me, lastNewEntryIndex+1, rf.getLastLogIndex())
+				rf.log = rf.log[:lastNewArrayIndex+1]
 				rf.persist() // 持久化日志截断
 			}
 		}
 	} else {
 		// 即使没有新条目，也要检查是否需要截断多余的日志
 		// 这是心跳消息的情况，确保日志不会超过PrevLogIndex
-		if len(rf.log) > args.PrevLogIndex+1 {
-			DPrintf("[%d] 心跳消息截断多余日志从索引 %d 到 %d", rf.me, args.PrevLogIndex+1, len(rf.log)-1)
-			rf.log = rf.log[:args.PrevLogIndex+1]
+		prevArrayIndex := args.PrevLogIndex - rf.lastIncludedIndex - 1
+		if rf.getMemoryLogLength() > prevArrayIndex+1 && prevArrayIndex >= 0 {
+			DPrintf("[%d] 心跳消息截断多余日志从索引 %d 到 %d", rf.me, args.PrevLogIndex+1, rf.getLastLogIndex())
+			rf.log = rf.log[:prevArrayIndex+1]
 			rf.persist() // 持久化日志截断
 		}
 	}
@@ -348,7 +392,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 成功时也初始化快速回退字段
 	reply.XTerm = -1
 	reply.XIndex = -1
-	reply.XLen = len(rf.log)
+	reply.XLen = rf.getMemoryLogLength()
 
 }
 
@@ -420,15 +464,15 @@ func (rf *Raft) sendHeartbeats() {
 
 			if rf.nextIndex[server] <= rf.getLastLogIndex() {
 				// 有需要复制的日志条目，发送包含日志条目的 AppendEntries
-				startArrayIndex := rf.nextIndex[server]
-				if startArrayIndex < len(rf.log) {
-					entries = make([]logEntry, len(rf.log)-startArrayIndex)
+				startArrayIndex := rf.nextIndex[server] - rf.lastIncludedIndex - 1
+				if startArrayIndex >= 0 && startArrayIndex < rf.getMemoryLogLength() {
+					entries = make([]logEntry, rf.getMemoryLogLength()-startArrayIndex)
 					copy(entries, rf.log[startArrayIndex:])
 				} else {
 					entries = make([]logEntry, 0)
 				}
 			} else {
-				// 没有新的日志条目，发送空的心跳
+				// 没有新的日志条目，发送空的 AppendEntries（心跳）
 				entries = make([]logEntry, 0)
 			}
 
@@ -542,8 +586,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 记录当前任期，防止在操作过程中任期变化
 	currentTerm := rf.currentTerm
 
-	//获得新的要添加的日志的索引位置
-	newLogIndex := len(rf.log) // 使用数组长度作为新的日志索引
+	//获得新的要添加的日志的索引位置 (逻辑索引)
+	newLogIndex := rf.getLastLogIndex() + 1
 	//创建一个新的Entry
 	newEntry := logEntry{
 		LogIndex: newLogIndex,
@@ -558,9 +602,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 再次检查Leader身份和任期，如果发生变化则回滚
 	if rf.state != Leader || rf.currentTerm != currentTerm {
 		// 回滚刚才添加的日志条目
-		rf.log = rf.log[:len(rf.log)-1]
-		rf.persist() // 持久化回滚
-		DPrintf("[%d] Start函数执行期间失去Leader身份，回滚日志条目", rf.me)
+		if rf.getMemoryLogLength() > 0 {
+			rf.log = rf.log[:rf.getMemoryLogLength()-1]
+			rf.persist() // 持久化回滚
+			DPrintf("[%d] Start函数执行期间失去Leader身份，回滚日志条目", rf.me)
+		}
 		return -1, rf.currentTerm, false
 	}
 
@@ -604,11 +650,18 @@ func (rf *Raft) sendAppendEntriesToPeer(server int) {
 		prevLogIndex := rf.nextIndex[server] - 1
 		var entries []logEntry
 
+		// Check if we need to send a snapshot instead
+		if rf.nextIndex[server] <= rf.lastIncludedIndex {
+			// TODO: Send InstallSnapshot RPC
+			rf.mu.Unlock()
+			return
+		}
+
 		if rf.nextIndex[server] <= rf.getLastLogIndex() {
 			// 有需要复制的日志条目
-			startArrayIndex := rf.nextIndex[server] // nextIndex本身就是要发送的第一个条目的逻辑索引，也等于数组索引
-			if startArrayIndex < len(rf.log) {
-				entries = make([]logEntry, len(rf.log)-startArrayIndex)
+			startArrayIndex := rf.logicalToArrayIndex(rf.nextIndex[server])
+			if startArrayIndex >= 0 && startArrayIndex < rf.getMemoryLogLength() {
+				entries = make([]logEntry, rf.getMemoryLogLength()-startArrayIndex)
 				copy(entries, rf.log[startArrayIndex:])
 			} else {
 				entries = make([]logEntry, 0)
@@ -617,7 +670,7 @@ func (rf *Raft) sendAppendEntriesToPeer(server int) {
 			// 没有新的日志条目，发送空的 AppendEntries（心跳）
 			entries = make([]logEntry, 0)
 		}
-		//构建 AppendEntries RPC 的参数
+
 		args := &AppendEntriesArgs{
 			Term:              rf.currentTerm,
 			LeaderId:          rf.me,
@@ -688,7 +741,7 @@ func (rf *Raft) updateCommitIndex() {
 	// 从最后一个日志条目开始向前检查
 	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
 		// 检查索引 N 处的日志条目是否可以提交
-		if N < len(rf.log) && rf.log[N].Term == rf.currentTerm { // 只能提交当前任期的日志条目
+		if rf.getLogTerm(N) == rf.currentTerm { // 只能提交当前任期的日志条目
 			count := 1 // Leader 自己算一票
 
 			// 统计有多少个节点已经复制了这个日志条目
@@ -701,7 +754,7 @@ func (rf *Raft) updateCommitIndex() {
 			// 如果大多数节点都复制了，就可以提交
 			if count >= len(rf.peers)/2+1 {
 				DPrintf("[%d] 提交日志条目到索引 %d (任期 %d), 获得 %d/%d 票支持, matchIndex=%v",
-					rf.me, N, rf.log[N].Term, count, len(rf.peers), rf.matchIndex)
+					rf.me, N, rf.getLogTerm(N), count, len(rf.peers), rf.matchIndex)
 				rf.commitIndex = N
 				return
 			} else {
@@ -775,7 +828,10 @@ func (rf *Raft) startNewElection() {
 
 // 获取最后一个日志条目的任期
 func (rf *Raft) getLastLogTerm() int {
-	return rf.log[len(rf.log)-1].Term
+	if rf.getMemoryLogLength() == 0 {
+		return rf.lastIncludedTerm
+	}
+	return rf.log[rf.getMemoryLogLength()-1].Term
 }
 
 func (rf *Raft) startElection() {
@@ -878,8 +934,48 @@ func (rf *Raft) becomeFollower(term int) {
 	rf.persist() // 持久化状态变化
 }
 
+// Helper methods for unified log indexing
+
+// 获取第一个日志条目的逻辑索引
+func (rf *Raft) getFirstLogIndex() int {
+	return rf.lastIncludedIndex + 1
+}
+
+// 获取最后一个日志条目的逻辑索引
 func (rf *Raft) getLastLogIndex() int {
-	return len(rf.log) - 1
+	if rf.getMemoryLogLength() == 0 {
+		return rf.lastIncludedIndex
+	}
+	return rf.lastIncludedIndex + rf.getMemoryLogLength()
+}
+
+// 获取日志条目总数（包括快照中的条目）
+func (rf *Raft) getTotalLogLength() int {
+	return rf.lastIncludedIndex + len(rf.log)
+}
+
+// 获取当前内存中的日志条目数量
+func (rf *Raft) getMemoryLogLength() int {
+	return len(rf.log)
+}
+
+// 将逻辑索引转换为数组索引
+func (rf *Raft) logicalToArrayIndex(logicalIndex int) int {
+	return logicalIndex - rf.lastIncludedIndex - 1
+}
+
+// 将数组索引转换为逻辑索引
+func (rf *Raft) arrayToLogicalIndex(arrayIndex int) int {
+	return rf.lastIncludedIndex + arrayIndex + 1
+}
+
+// 检查是否有某个逻辑索引的日志条目（在内存中）
+func (rf *Raft) hasLogEntry(logicalIndex int) bool {
+	if logicalIndex <= rf.lastIncludedIndex {
+		return false // 在快照中
+	}
+	arrayIndex := rf.logicalToArrayIndex(logicalIndex)
+	return arrayIndex >= 0 && arrayIndex < rf.getMemoryLogLength()
 }
 
 // 获取指定索引日志条目的任期
@@ -890,11 +986,17 @@ func (rf *Raft) getLogTerm(index int) int {
 	if index == 0 {
 		return 0 // 索引0的日志条目任期为0
 	}
-	if index >= len(rf.log) { // 检查索引边界
-		DPrintf("[%d] getLogTerm: 索引 %d 越界，日志长度 %d", rf.me, index, len(rf.log))
+	if index <= rf.lastIncludedIndex {
+		return rf.lastIncludedTerm
+	}
+
+	// Convert logical index to array index
+	arrayIndex := index - rf.lastIncludedIndex - 1
+	if arrayIndex < 0 || arrayIndex >= rf.getMemoryLogLength() {
+		DPrintf("[%d] getLogTerm: 索引 %d 越界，日志长度 %d, lastIncludedIndex %d", rf.me, index, rf.getMemoryLogLength(), rf.lastIncludedIndex)
 		return -1
 	}
-	return rf.log[index].Term
+	return rf.log[arrayIndex].Term
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -918,11 +1020,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]logEntry, 1)
-	rf.log[0] = logEntry{LogIndex: 0, Term: 0, Command: nil}
+	rf.log = make([]logEntry, 0)
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -969,24 +1072,26 @@ func (rf *Raft) applier() {
 			rf.lastApplied++
 			applyIndex := rf.lastApplied
 
-			// 检查日志索引是否有效
-			if applyIndex >= len(rf.log) {
-				DPrintf("[%d] 错误: 尝试应用索引 %d 但日志长度只有 %d", rf.me, applyIndex, len(rf.log))
+			// 检查是否有该日志条目
+			if !rf.hasLogEntry(applyIndex) {
+				DPrintf("[%d] 错误: 尝试应用逻辑索引 %d 但该条目不在内存中, lastIncludedIndex=%d, log长度=%d",
+					rf.me, applyIndex, rf.lastIncludedIndex, rf.getMemoryLogLength())
 				rf.lastApplied-- // 回滚
 				break
 			}
 
-			if rf.log[applyIndex].Command != nil {
+			arrayIndex := rf.logicalToArrayIndex(applyIndex)
+			if rf.log[arrayIndex].Command != nil {
 				// 使用日志条目中的逻辑索引，而不是数组索引
-				logicalIndex := rf.log[applyIndex].LogIndex
+				logicalIndex := rf.log[arrayIndex].LogIndex
 				applyMsg := raftapi.ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[applyIndex].Command,
+					Command:      rf.log[arrayIndex].Command,
 					CommandIndex: logicalIndex,
 				}
 				toApply = append(toApply, applyMsg)
 				DPrintf("[%d] 准备应用日志条目: arrayIndex=%d, logicalIndex=%d, command=%v",
-					rf.me, applyIndex, logicalIndex, rf.log[applyIndex].Command)
+					rf.me, arrayIndex, logicalIndex, rf.log[arrayIndex].Command)
 			}
 		}
 		rf.mu.Unlock()
@@ -1014,9 +1119,9 @@ func (rf *Raft) optimizeNextIndex(server int, reply *AppendEntriesReply) int {
 	lastIndexOfXTerm := -1
 
 	// Leader 从自己的日志中倒序查找是否有和 Follower 冲突的 XTerm 任期的日志条目
-	for i := len(rf.log) - 1; i >= 0; i-- {
+	for i := rf.getMemoryLogLength() - 1; i >= 0; i-- {
 		if rf.log[i].Term == conflictTerm {
-			lastIndexOfXTerm = i
+			lastIndexOfXTerm = i + rf.lastIncludedIndex + 1 // Convert to logical index
 			break
 		}
 	}
